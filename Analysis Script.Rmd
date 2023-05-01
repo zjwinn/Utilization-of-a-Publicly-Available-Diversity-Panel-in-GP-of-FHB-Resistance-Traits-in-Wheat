@@ -1,0 +1,2169 @@
+---
+title: "Genomic Prediction in the SUWWSN"
+author: "Zachary Winn"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 12, fig.height = 8)
+```
+
+# Introduction
+
+In this script, I will be exploring methods of performing genomic prediction in the southern winter wheat scab nursery. As it stands we have GBS data, QTL call information, and phenotypic data spanning from 2011-2021. I intend to hold out 2020 and 2021 and forward predict those years using 2011 to 2019. I will only be working with Fusarium damaged kernels (FDK) and vomitoxin content (DON).
+
+# Reading in the data and formatting
+
+In this step, I read in the data and properly format the files for use in rrBLUP. I will not display this in the markdown. 
+
+```{r, include=FALSE, warning=FALSE}
+#remove list
+remove(list=ls())
+
+#set working directory
+setwd("C:/Users/zwinn/OneDrive/Publication/Manuscripts In Progress/SUWWSN GS/First Revision/Analysis and Data")
+
+#library
+library(readxl)
+
+#read in suwwsn data
+suwwsn_all<-read.csv("FHB_all_2011-2021_withQTL_101821.csv")
+
+#library
+library(gaston)
+
+#read in suwwsn GBS data
+gbs_mat<-read.vcf("Sungrains_March2022_postimp_filt.vcf.gz",
+                  convert.chr = F)
+gbs_mat<-as.matrix(gbs_mat)
+
+#read in QTL compendium
+qtl_comp<-read.csv("QTL_calls_mode_062122.csv",
+                   check.names = F)
+
+#pull gbs data for suwwsn
+name_matcher=data.frame(FullSampleName=rownames(gbs_mat))
+
+#library
+library(tidyverse)
+
+#organize list
+name_matcher<-name_matcher %>%
+  separate(col = FullSampleName, into = c("project_code", "library_prep_id", "a", "b"), remove = F, sep = ":") %>%
+  mutate(Genotype=ifelse(is.na(b), a, b)) %>%
+  select(FullSampleName, library_prep_id) %>%
+  mutate(library_prep_id=as.numeric(library_prep_id))
+
+#bind to full dataset
+suwwsn_all<-left_join(suwwsn_all, name_matcher, by="library_prep_id")
+
+#select in suwwsn data
+suwwsn_all<-suwwsn_all %>% 
+  drop_na(FullSampleName) %>%
+  select(FullSampleName,
+         library_prep_id,
+         Location, 
+         Year, 
+         Env,
+         Genotype, 
+         FDK, 
+         DON)
+
+#select in qtl compendium
+qtl_comp<-qtl_comp %>%
+  select(library_prep_id,
+         `Rht-B1`,                      
+         `Rht-D1`,
+         `Ppd-A1`,
+         `Ppd-B1_CS`,
+         `Ppd-B1_S64`,
+         `Ppd-D1`,
+         `vrn-A1`,
+         `vrn-B1`,
+         `Vrn-D1`,
+         `Fhb1`,
+         `Fhb_1B_Jamestown`,
+         `Fhb_1A_Neuse`,
+         `Fhb_4A_Neuse`,
+         `Fhb_6A_Neuse`,
+         `Fhb_2B_Bess`,
+         `Fhb_3B_Bess`) %>%
+  drop_na(library_prep_id) %>%
+  distinct(library_prep_id, .keep_all = T)
+colnames(qtl_comp)<-gsub("-","_",colnames(qtl_comp))
+colnames(qtl_comp)[2:ncol(qtl_comp)]<-toupper(colnames(qtl_comp)[2:ncol(qtl_comp)])
+
+#bind in QTL 
+suwwsn_all<-suwwsn_all %>%
+  left_join(qtl_comp, by="library_prep_id")
+
+#drop NAs
+suwwsn_all<-suwwsn_all %>%
+  drop_na(FDK, DON)
+
+#remove
+remove(qtl_comp,
+       name_matcher)
+
+#select lines that are in the gbs mat
+gbs_mat<-gbs_mat[rownames(gbs_mat) %in% suwwsn_all$FullSampleName,]
+suwwsn_all<-suwwsn_all %>%
+  filter(FullSampleName %in% rownames(gbs_mat))
+
+#check to see if all the names in the suwwsn
+#are present in the gbs dat
+unique(unique(suwwsn_all$FullSampleName) %in% rownames(gbs_mat))
+
+#check for commercial lines
+suwwsn_names<-unique(suwwsn_all$FullSampleName)
+com_ids<-c(":kws",
+           ":les",
+           ":lcs",
+           ":p",
+           ":pioneer",
+           ":pio")
+remove_me<-c()
+
+for(i in com_ids){
+  remove_me<-c(remove_me, suwwsn_names[grep(i, suwwsn_names, ignore.case = T)])
+}
+
+suwwsn_all<-suwwsn_all %>%
+  filter(!FullSampleName %in% remove_me)
+
+suwwsn_names<-unique(suwwsn_all$FullSampleName)
+
+#partition phenotypic data into forward validation and cross validation
+suwwsn_fv<-suwwsn_all %>%
+  filter(Year==2020 | Year==2021)
+suwwsn_cv<-suwwsn_all %>%
+  filter(!Year==2020) %>%
+  filter(!Year==2021)
+suwwsn_fv<-suwwsn_fv %>%
+  filter(!FullSampleName %in% suwwsn_cv$FullSampleName)
+
+gbs_mat<-gbs_mat[rownames(gbs_mat) %in% suwwsn_names,]
+
+#write.csv(suwwsn_names,"jeanette_check.csv", row.names = F)
+remove(com_ids, i, remove_me, suwwsn_names)
+
+save.image(file = "Formatted Data.RData")
+```
+
+# Display heads of the data
+
+Now that I have read in the data, we can describe the data sets. Firstly we have an imputed GBS matrix that contains the genetic information of all the lines across years (n=439). Then we have a phenotypic dataset of FDK and DON measurements of GBS genotyped lines from 2011-2019 in the SUWWSN (n=365). Then, we have smaller dataset of lines in the SUWWSN from 2020-2021 which also has FDK and DON measurements aligned with GBS genotype information (n=74). Also, I have put the QTL call information of many  QTL onto the dataframes for the SUWWSN.
+
+```{r}
+#remove list
+remove(list=ls())
+
+#load data
+load("Formatted Data.RData")
+
+#library
+library(knitr)
+
+#print head
+kable(gbs_mat[1:5, 1:5], caption = "Head of the GBS Matrix")
+
+#print head
+kable(suwwsn_cv[1:5, 1:10], caption = "Head of the SUWWSN cross validation data")
+
+#print head
+kable(suwwsn_fv[1:5, 1:10], caption = "Head of the SUWWSN forward validation data")
+```
+
+# Defining clusters in the data
+
+We know that for every year of the dataset, that there are a couple repeating checks: Jamestown, Bess, Coker9835, Ernie. These checks happen in every year of the SUWWSN. We can draw these checks out, by location, and look at their correlation. We can use the correlation among these checks to cluster environments via K-means clustering, and we can decide the appropriate number of environments by using a metric to decide the appropriate number of environments. 
+
+```{r}
+#check if checks are consistent across all environments
+remove_me<-c()
+for(i in unique(suwwsn_cv$Env)){
+  a<-suwwsn_cv %>%
+    filter(Env==i) %>%
+    filter(FullSampleName=="03:110383:ERNIE"|
+             FullSampleName=="03:110384:COKER9835"|
+             FullSampleName=="03:110385:BESS"|
+             FullSampleName=="03:110386:JAMESTOWN") %>%
+    distinct(FullSampleName) %>%
+    count()
+  a<-as.numeric(a)
+  if(a==4){
+    #print(paste(i, "has all four checks"))
+  }else{
+    #print(paste("Check", i, "it looks like not all checks are there"))
+    remove_me<-c(remove_me,i)
+  }
+}
+
+#remove environments that do not have these lines
+suwwsn_cv<-suwwsn_cv %>%
+  filter(!Env %in% remove_me)
+
+#make a matrix of checks
+check_mat_fdk<-data.frame(FullSampleName=c("03:110383:ERNIE",
+                                           "03:110384:COKER9835",
+                                           "03:110385:BESS",
+                                           "03:110386:JAMESTOWN"))
+
+check_mat_don<-data.frame(FullSampleName=c("03:110383:ERNIE",
+                                           "03:110384:COKER9835",
+                                           "03:110385:BESS",
+                                           "03:110386:JAMESTOWN"))
+for(i in c("FDK", "DON")){
+  for(j in unique(suwwsn_cv$Env)){
+    a<-suwwsn_cv %>%
+      select(FullSampleName, Env, all_of(i)) %>%
+      filter(Env==all_of(j)) %>%
+      filter(FullSampleName=="03:110383:ERNIE"|
+               FullSampleName=="03:110384:COKER9835"|
+               FullSampleName=="03:110385:BESS"|
+               FullSampleName=="03:110386:JAMESTOWN") %>%
+      select(FullSampleName, all_of(i))
+    colnames(a)[2]=j
+    if(i=="FDK"){
+      check_mat_fdk<-left_join(check_mat_fdk, a, by="FullSampleName")
+      remove(a)
+    }else{
+      check_mat_don<-left_join(check_mat_don, a, by="FullSampleName")
+      remove(a)
+    }
+    }
+}
+
+#library
+library(GGEBiplots)
+
+fdk_gge<-GGEModel(check_mat_fdk[,2:ncol(check_mat_fdk)],
+                  centering = "tester")
+
+GGEPlot(fdk_gge, type = 4)
+
+
+don_gge<-GGEModel(check_mat_don[,2:ncol(check_mat_don)],
+                  centering = "tester")
+
+GGEPlot(don_gge, type = 4)
+
+
+#library
+library(NbClust)
+
+#calculate dissimilarity index
+nb_clust_fdk<-NbClust(data = t(check_mat_fdk[,2:ncol(check_mat_fdk)]), 
+                      diss = NULL, 
+                      distance = "euclidean", 
+                      min.nc = 2, 
+                      max.nc = 15,
+                      method = "ward.D2",
+                      index = "all")
+
+nb_clust_fdk_best_clust<-nb_clust_fdk$Best.nc
+
+nb_clust_don<-NbClust(data = t(check_mat_don[,2:ncol(check_mat_don)]), 
+                      diss = NULL, 
+                      distance = "euclidean", 
+                      min.nc = 2, 
+                      max.nc = 15,
+                      method = "ward.D2",
+                      index = "all")
+
+nb_clust_don_best_clust<-nb_clust_don$Best.nc
+
+
+clust_sup_table<-rbind(nb_clust_fdk_best_clust,
+                       nb_clust_don_best_clust)
+
+clust_sup_table<-t(clust_sup_table)
+
+clust_sup_table<-data.frame(clust_sup_table) %>%
+  rownames_to_column(var="Method")
+
+clust_sup_table<-rbind(c(NA, "fdk", "fdk", "don", "don"), clust_sup_table)
+
+write.csv(clust_sup_table,
+          "clust_sup_table.csv",
+          row.names = FALSE)
+
+#create a PCA show clusters
+pca_fdk<-princomp(t(check_mat_fdk[,2:ncol(check_mat_fdk)]))
+pca_don<-princomp(t(check_mat_don[,2:ncol(check_mat_don)]))
+
+#show summary
+summary(pca_fdk)
+summary(pca_don)
+
+#library
+library(ggplot2)
+
+#show clusters in pca
+clusters_fdk<-data.frame(Env=names(nb_clust_fdk$Best.partition),
+                         FDK_clusters=nb_clust_fdk$Best.partition)
+clusters_don<-data.frame(Env=names(nb_clust_don$Best.partition),
+                         DON_clusters=nb_clust_don$Best.partition)
+clusters<-left_join(clusters_fdk, clusters_don, by="Env")
+
+pcs_fdk<-data.frame(pca_fdk$scores)
+pcs_fdk<-rownames_to_column(pcs_fdk, var="Env")
+colnames(pcs_fdk)=gsub("Comp.", "PC", colnames(pcs_fdk))
+
+pcs_don<-data.frame(pca_don$scores)
+pcs_don<-rownames_to_column(pcs_don, var="Env")
+colnames(pcs_don)=gsub("Comp.", "PC", colnames(pcs_don))
+
+clusters_fdk<-left_join(clusters_fdk, pcs_fdk, by="Env")
+clusters_don<-left_join(clusters_don, pcs_don, by="Env")
+
+ggplot(data = clusters_fdk, aes(x=PC1, y=PC2, shape=as.factor(FDK_clusters), color=as.factor(FDK_clusters)))+
+  geom_point(size=2)+
+  labs(title="PCA of FDK Among Checks in the SUWWSN",
+       color="Cluster",
+       shape="Cluster")+
+  theme_bw()
+
+ggplot(data = clusters_don, aes(x=PC1, y=PC2, shape=as.factor(DON_clusters), color=as.factor(DON_clusters)))+
+  geom_point(size=2)+
+  labs(title="PCA of DON Among Checks in the SUWWSN",
+       color="Cluster",
+       shape="Cluster")+
+  theme_bw()
+
+#add clustering info to suwwsn_cv
+suwwsn_cv<-left_join(suwwsn_cv, clusters, by="Env")
+
+#library
+library(asreml)
+
+#define traits
+traits<-c("FDK", "DON")
+
+#make a dataframe for predictions
+preds<-data.frame(FullSampleName=unique(suwwsn_cv$FullSampleName))
+
+for(i in traits){
+  a<-suwwsn_cv %>%
+    select(FullSampleName, Env, grep(i, colnames(suwwsn_cv)))
+  colnames(a)[3]="y"
+  colnames(a)[4]="cluster"
+  b<-a %>%
+    select(cluster) %>%
+    distinct()
+  b<-b[,1]
+  
+  for(j in b){
+    c<-a %>%
+      filter(cluster==all_of(j))
+    c[,1:2]<-lapply(c[,1:2], as.factor)
+    fit<-asreml(fixed = y~FullSampleName,
+                random = ~idv(Env),
+                residual = ~idv(units),
+                data = c,
+                trace = F)
+    wald(fit)
+    pred<-predict(fit, 
+                  classify = "FullSampleName",
+                  trace=F)
+    pred<-pred$pvals[,1:2]
+    colnames(pred)[2]<-paste(i, "cluster", j, sep = "_")
+    preds<-left_join(preds, pred, by="FullSampleName")
+  }
+}
+
+remove(a,b,c,i,j)
+
+#library
+library(psych)
+
+#plot
+pairs.panels(preds[,2:ncol(preds)],
+             lm = T,
+             ellipses = F,
+             hist.col = "gray",
+             stars = T)
+
+#write csv
+write.csv(clusters, "Environmental_Clustering.csv", row.names = F)
+```
+
+# Calculating heritability within envrionment
+
+```{r}
+#library
+library(rrBLUP)
+
+#create grm
+grm_all<-A.mat(gbs_mat)
+grm_cv<-grm_all[rownames(grm_all) %in% suwwsn_cv$FullSampleName,
+                colnames(grm_all) %in% suwwsn_cv$FullSampleName]
+
+#make objects for results
+traits=c("FDK", "DON")
+h_env_trait<-list()
+
+for (i in traits){
+  
+  #pull data
+  a<-suwwsn_all%>%
+    select(FullSampleName,
+           Env,
+           all_of(i)) %>%
+    drop_na()
+  
+  #rename columns
+  colnames(a)[ncol(a)]<-"y"
+  
+  #make a list of environments
+  envs<-unique(a$Env)
+  
+  #make an object for heritability
+  h_env<-c()
+  
+  for(j in envs){
+    
+    #pull environment
+    b<-a %>%
+      filter(Env==all_of(j))
+    
+    #pull grm for environment
+    grm=grm_all[rownames(grm_all) %in% b$FullSampleName,
+                colnames(grm_all) %in% b$FullSampleName]
+    
+    #make sure grm and environment have the same levels
+    b<-b %>%
+      filter(FullSampleName %in% rownames(grm_all))
+    
+    #select correct traits
+    b<-b %>%
+      select(FullSampleName, Env, y)
+    
+    #make factor
+    b[,1:2]<-lapply(b[,1:2], as.factor)
+    
+    #fit gBLUP
+    fit<-asreml(fixed=y~1,
+                random = ~vm(FullSampleName, grm),
+                residual = ~idv(units),
+                data = b,
+                maxit = 100,
+                trace = FALSE)
+    
+    #predict h2
+    h<-vpredict(fit, xform = ~V1/(V1+V2+V3))
+    
+    #make object
+    h<-data.frame(Env=j,
+                  H2=as.numeric(h$Estimate), 
+                  SE=as.numeric(h$SE))
+    
+    #bind object
+    h_env<-rbind(h_env, h)
+  }
+  
+  #place object in list
+  h_env_trait[[i]]<-h_env
+  
+}
+
+h_overall<-c()
+
+for(i in traits){
+  a<-h_env_trait[[i]]
+  a[,"Trait"]=i
+  a<-a %>%
+    select(Trait, Env ,H2, SE)
+  a$H2=round(a$H2, digits = 3)
+  a$SE=round(a$SE, digits = 3)
+  a<-a[order(a$Trait),]
+  h_overall<-rbind(h_overall, a)
+}
+
+#write csv
+write.csv(h_overall, "Environmental_Heritability.csv", row.names = F)
+```
+
+# Comment
+Looks like there are some big rank changes between clusters. This should make some interesting changes...
+
+# Write a function for five fold univariate cross-validation
+Here I will make a function for cross validation in asreml. 
+
+```{r}
+#### for testing (commented out)####
+
+#library
+#library(rrBLUP)
+
+#create grm
+#grm_all<-A.mat(gbs_mat)
+#grm_cv<-grm_all[rownames(grm_all) %in% suwwsn_cv$FullSampleName,
+#                colnames(grm_all) %in% suwwsn_cv$FullSampleName]
+
+#check if the matrices are correct
+#unique(unique(suwwsn_all$FullSampleName) %in% rownames(grm_all))
+#length(unique(suwwsn_all$FullSampleName))==length(rownames(grm_all))
+#unique(unique(suwwsn_cv$FullSampleName) %in% rownames(grm_cv))
+#length(unique(suwwsn_cv$FullSampleName))==length(rownames(grm_cv))
+
+#make a generic formula for asrmel
+#data=suwwsn_cv
+#genotype_col_name="FullSampleName"
+#env_col_name="Env"
+#trait="FDK"
+#grm=grm_cv
+#fixed = formula(y~1)
+#random = formula(~vm(FullSampleName, b)+idv(Env))
+#residual = formula(~idv(units))
+
+#load requirements
+library(tidyverse)
+library(asreml)
+
+#### write the function ####
+univariate_five_fold_cv<-function(data,
+                                  genotype_col_name,
+                                  env_col_name, 
+                                  trait, 
+                                  grm,
+                                  fixed,
+                                  random,
+                                  residual){
+  
+  #pull relevant data
+  a<-data %>%
+    select(all_of(genotype_col_name),
+           all_of(env_col_name),
+           all_of(trait))
+  
+  #rename columns
+  colnames(a)=c("FullSampleName", "Env", "y")
+  
+  #make first two columns into levels
+  a[,1:2]<-lapply(a[,1:2], as.factor)
+  
+  #select out only the lines in dataset from the grm
+  b<-grm[rownames(grm) %in% unique(a[,1]),
+         colnames(grm) %in% unique(a[,1])]
+  
+  #check if grm and data are same size
+  if(isTRUE(unique(unique(a[,1]) %in% rownames(b)))){
+    #for testing
+    #print(paste("The dataframe and grm have the same number of lines;",
+    #            "proceeding with analysis for",
+    #            i))
+  }else{
+    print(paste("Not all lines in the dataset are found in the grm;",
+                "aborting analysis for",
+                i))
+    return(NA)
+  }
+  
+  #move on after truth check
+  #make a partition of the dataset randomly into training and test
+  train=sample(length((rownames(b))),
+               size = round(length((rownames(b)))*.8, digits = 0))
+  test=rownames(b)[-train]
+  train=rownames(b)[train]
+  
+  if(isFALSE(unique(test %in% train))){
+    #for testing
+    #print(paste("Subdivsion of training and test successful;",
+    #            "proceeding with analysis for",
+    #            i))
+  }else{
+    print(paste("Subdivsion of training and test unsuccessful;",
+                "check grm for duplicated name..."))
+  }
+
+  #you have to assign things to the global environment because asreml is stupid
+  assign("a", a, envir = globalenv() )
+  assign("b", b, envir = globalenv() )
+  assign("fixed", fixed, envir = globalenv() )
+  assign("random", random, envir = globalenv() )
+  assign("residual", residual, envir = globalenv() )
+  
+  #calculate a dataset of adjusted means for the
+  #the training data
+  test_preds_actual<-asreml(fixed = y~FullSampleName,
+                            random = ~idv(Env),
+                            residual = ~idv(units),
+                            data = a,
+                            trace = FALSE)
+          
+  test_preds_actual<-predict(test_preds_actual, classify = "FullSampleName")$pvals[,1:2]
+  test_preds_actual<-test_preds_actual %>% filter(FullSampleName %in% test)
+  
+  #move on after truth check
+  #partition dataset
+  train<-a 
+  train[train$FullSampleName %in% test, "y"]=NA  
+  
+  #run ASREML gBLUP
+  train_preds_predicted<-asreml(fixed = fixed,
+                                random = random,
+                                residual = residual,
+                                data = train,
+                                trace = FALSE)
+  
+  #pull predictions for test
+  train_preds_predicted<-predict(train_preds_predicted, classify = "FullSampleName")$pvals[,1:2]
+  train_preds_predicted<-train_preds_predicted %>%
+    filter(FullSampleName %in% test_preds_actual$FullSampleName)
+  
+  #align results
+  colnames(test_preds_actual)[2]="Actual"
+  colnames(train_preds_predicted)[2]="Predicted"
+  corr<-full_join(test_preds_actual, train_preds_predicted, by="FullSampleName")
+  
+  #calculate correlation
+  corr<-cor(corr[,2:3])["Actual", "Predicted"]
+  
+  #return the correlation
+  return(corr)
+  
+}
+
+
+#### for testing (commented out) ####
+
+#perms=10
+#results=c()
+#for(i in 1:perms){
+#  print(paste("Perm", i))
+#  a<-univariate_five_fold_cv(data = data, 
+#                             trait = "FDK",
+#                             genotype_col_name = "FullSampleName",
+#                             env_col_name = "Env",
+#                             grm = grm_cv)
+#  results<-c(results, a)
+#  remove(a)
+#}
+#summary(results)
+```
+
+# Write a function for five fold multivariate cross-validation
+
+Here I write a function to perform multivariate cross-validation. 
+
+```{r}
+#### for testing (commented out)####
+
+#library
+#library(rrBLUP)
+
+#create grm
+#grm_all<-A.mat(gbs_mat)
+#grm_cv<-grm_all[rownames(grm_all) %in% suwwsn_cv$FullSampleName,
+#                colnames(grm_all) %in% suwwsn_cv$FullSampleName]
+
+#check if the matrices are correct
+#unique(unique(suwwsn_all$FullSampleName) %in% rownames(grm_all))
+#length(unique(suwwsn_all$FullSampleName))==length(rownames(grm_all))
+#unique(unique(suwwsn_cv$FullSampleName) %in% rownames(grm_cv))
+#length(unique(suwwsn_cv$FullSampleName))==length(rownames(grm_cv))
+
+#make a generic formula for asrmel
+#data=suwwsn_cv
+#genotype_col_name="FullSampleName"
+#env_col_name="Env"
+#traits=c("FDK","DON")
+#grm=grm_cv
+#fixed = formula(cbind(y_1, y_2)~1+trait)
+#random = formula(~vm(FullSampleName, b)+vm(FullSampleName,b):idv(trait)+idv(Env))
+#residual = formula(~id(units):idv(trait))
+
+#load requirements
+library(tidyverse)
+library(asreml)
+
+#### write the function ####
+multivariate_five_fold_cv<-function(data,
+                                    genotype_col_name,
+                                    env_col_name, 
+                                    traits, 
+                                    grm,
+                                    fixed,
+                                    random,
+                                    residual){
+  
+  #pull relevant data
+  a<-data %>%
+    select(all_of(genotype_col_name),
+           all_of(env_col_name),
+           all_of(traits))
+  
+  colnames(a)<-c("FullSampleName",
+                 "Env",
+                 "y_1",
+                 "y_2")
+
+  
+  #make first two columns into levels
+  a[,1:2]<-lapply(a[,1:2], as.factor)
+  
+  #select out only the lines in dataset from the grm
+  b<-grm[rownames(grm) %in% unique(a[,1]),
+         colnames(grm) %in% unique(a[,1])]
+  
+  #check if grm and data are same size
+  if(isTRUE(unique(unique(a[,1]) %in% rownames(b)))){
+    #for testing
+    #print(paste("The dataframe and grm have the same number of lines;",
+    #            "proceeding with analysis for",
+    #            i))
+  }else{
+    print(paste("Not all lines in the dataset are found in the grm;",
+                "aborting analysis for",
+                i))
+    return(NA)
+  }
+  
+  #move on after truth check
+  #make a partition of the dataset randomly into training and test
+  train=sample(length((rownames(b))),
+               size = round(length((rownames(b)))*.8, digits = 0))
+  test=rownames(b)[-train]
+  train=rownames(b)[train]
+  
+  if(isFALSE(unique(test %in% train))){
+    #for testing
+    #print(paste("Subdivsion of training and test successful;",
+    #            "proceeding with analysis for",
+    #            i))
+  }else{
+    print(paste("Subdivsion of training and test unsuccessful;",
+                "check grm for duplicated name..."))
+  }
+  
+  #you have to assign things to the global environment because asreml is stupid
+  assign("a", a, envir = globalenv() )
+  assign("b", b, envir = globalenv() )
+  assign("fixed", fixed, envir = globalenv() )
+  assign("random", random, envir = globalenv() )
+  assign("residual", residual, envir = globalenv() )
+  
+  #calculate a dataset of adjusted means for the
+  #the training data
+  test_preds_actual<-asreml(fixed = cbind(y_1, y_2)~ trait + FullSampleName + FullSampleName:trait, 
+                            random =~idv(Env), 
+                            residual = ~id(units):idv(trait),
+                            data = a,
+                            trace = FALSE)
+          
+  test_preds_actual<-predict(test_preds_actual, classify = "FullSampleName:trait")$pvals
+  test_preds_actual<-test_preds_actual %>% filter(FullSampleName %in% test)
+  
+  #move on after truth check
+  #partition dataset
+  train<-a 
+  train[train$FullSampleName %in% test, "y_1"]=NA  
+  train[train$FullSampleName %in% test, "y_2"]=NA
+  
+  #run ASREML gBLUP
+  train_preds_predicted<-asreml(fixed = fixed,
+                                random = random,
+                                residual = residual,
+                                data = train,
+                                trace = FALSE)
+  
+  #pull predictions for test
+  train_preds_predicted<-predict(train_preds_predicted, classify = "FullSampleName:trait")$pvals
+  train_preds_predicted<-train_preds_predicted %>%
+    filter(FullSampleName %in% test_preds_actual$FullSampleName)
+  
+  #align results
+  colnames(test_preds_actual)[3]="Actual"
+  colnames(train_preds_predicted)[3]="Predicted"
+  test_preds_actual<-test_preds_actual[,1:3]
+  train_preds_predicted<-train_preds_predicted[,1:3]
+  
+  corr<-full_join(test_preds_actual, train_preds_predicted, by=c("FullSampleName", "trait"))
+  
+  #calculate correlation
+  corr_1<-cor(corr %>% filter(trait=="y_1") %>% select(Actual, Predicted))[1,2]
+  corr_2<-cor(corr %>% filter(trait=="y_2") %>% select(Actual, Predicted))[1,2]
+  
+  #bind
+  corr<-c(corr_1, corr_2)
+  names(corr)<-c(traits[1], traits[2])
+  
+  #return the correlation
+  return(corr)
+}
+
+#### for testing (commented out) ####
+
+#perms=3
+#results=c()
+#for(i in 1:perms){
+#  print(paste("Perm", i))
+#  a<-multivariate_five_fold_cv(data = data, 
+#                               trait = c("FDK", "DON"),
+#                               genotype_col_name = "FullSampleName",
+#                               env_col_name = "Env",
+#                               grm = grm_cv,
+#                               fixed = fixed,
+#                               random = random,
+#                               residual = residual)
+#  results<-rbind(results, a)
+#  remove(a)
+#}
+#summary(results)
+```
+
+# Calculate Cross Validation Accuracies
+
+Here, I calculate cross validation accuracies.
+
+```{r}
+#library
+library(rrBLUP)
+
+#create grm
+grm_all<-A.mat(gbs_mat)
+grm_cv<-grm_all[rownames(grm_all) %in% suwwsn_cv$FullSampleName,
+                colnames(grm_all) %in% suwwsn_cv$FullSampleName]
+
+#check if the matrices are correct
+unique(unique(suwwsn_all$FullSampleName) %in% rownames(grm_all))
+length(unique(suwwsn_all$FullSampleName))==length(rownames(grm_all))
+unique(unique(suwwsn_cv$FullSampleName) %in% rownames(grm_cv))
+length(unique(suwwsn_cv$FullSampleName))==length(rownames(grm_cv))
+
+#make lists
+traits=c("FDK", "DON")
+perms=100
+results=c()
+
+#define models
+fixed_uv = formula(y~1)
+random_uv = formula(~vm(FullSampleName, b)+idv(Env))
+residual_uv = formula(~idv(units))
+fixed_mv = formula(cbind(y_1, y_2)~1+trait)
+random_mv = formula(~vm(FullSampleName, b)+vm(FullSampleName,b):idv(trait)+idv(Env))
+residual_mv = formula(~id(units):idv(trait))
+
+#define verbose
+verbose=T
+
+#find cv results
+files<-list.files()
+files<-files[grep("CV-Results", files)]
+
+#check if I should do CV
+if(length(files)>0){
+  
+  print("Cross-Validation has already been done: moving on...")
+  load(file = files[1])
+
+}else{
+  
+  #write the loop to do CV
+  for(i in traits){
+  
+    #performing cross validation
+    if(verbose==T){
+      print(paste("Performing cross validation for", i))
+    }else{
+        #Do nothing
+    }
+    
+    for(j in 1:perms){
+  
+        #performing cross validation
+        if(verbose==T){
+          print(paste(round(100*(j/perms), digits = 1), 
+                      "%", 
+                      sep = ""))
+        }else{
+            #Do nothing
+        }
+      
+      #all the data
+      z=suwwsn_cv
+      
+      zero<-multivariate_five_fold_cv(data = z,
+                                      genotype_col_name = "FullSampleName",
+                                      env_col_name = "Env",
+                                      traits = traits,
+                                      grm = grm_cv,
+                                      fixed = fixed_mv,
+                                      random = random_mv,
+                                      residual = residual_mv)
+      zero<-zero[i]
+      
+      #print(zero)
+      
+      one<-univariate_five_fold_cv(data = z,
+                                   genotype_col_name = "FullSampleName",
+                                   env_col_name = "Env",
+                                   trait = i,
+                                   grm = grm_cv,
+                                   fixed = fixed_uv,
+                                   random = random_uv,
+                                   residual = residual_uv)
+      
+      #print(one)
+      
+      if(i=="FDK"){
+        
+        #only cluster 1
+        z=suwwsn_cv %>% filter(FDK_clusters==1)
+        
+        two<-univariate_five_fold_cv(data = z,
+                                     genotype_col_name = "FullSampleName",
+                                     env_col_name = "Env",
+                                     trait = i,
+                                     grm = grm_cv,
+                                     fixed = fixed_uv,
+                                     random = random_uv,
+                                     residual = residual_uv)
+        
+        #print(two)
+        
+        #only cluster 2
+        z=suwwsn_cv %>% filter(FDK_clusters==2)
+        
+        three<-univariate_five_fold_cv(data = z,
+                                       genotype_col_name = "FullSampleName",
+                                       env_col_name = "Env",
+                                       trait = i,
+                                       grm = grm_cv,
+                                       fixed = fixed_uv,
+                                       random = random_uv,
+                                       residual = residual_uv)
+        #print(three)
+        
+        #create na object
+        four=NA
+        
+        #only h2>0.1
+        h_threshold=h_overall %>%
+          filter(Trait==all_of(i)) %>%
+          filter(h2>0.1)
+        z=suwwsn_cv %>% 
+          filter(Env %in% h_threshold$Env)
+        
+        five<-univariate_five_fold_cv(data = z,
+                                     genotype_col_name = "FullSampleName",
+                                     env_col_name = "Env",
+                                     trait = i,
+                                     grm = grm_cv,
+                                     fixed = fixed_uv,
+                                     random = random_uv,
+                                     residual = residual_uv)
+        
+        #print(five)
+        
+        #only h2>0.25
+        h_threshold=h_overall %>%
+          filter(Trait==all_of(i)) %>%
+          filter(h2>0.25)
+        z=suwwsn_cv %>% 
+          filter(Env %in% h_threshold$Env)
+        
+        six<-univariate_five_fold_cv(data = z,
+                                     genotype_col_name = "FullSampleName",
+                                     env_col_name = "Env",
+                                     trait = i,
+                                     grm = grm_cv,
+                                     fixed = fixed_uv,
+                                     random = random_uv,
+                                     residual = residual_uv)
+  
+        #print(six)
+        
+        #only h2>0.50
+        h_threshold=h_overall %>%
+          filter(Trait==all_of(i)) %>%
+          filter(h2>0.50)
+        z=suwwsn_cv %>% 
+          filter(Env %in% h_threshold$Env)
+        
+        seven<-univariate_five_fold_cv(data = z,
+                                     genotype_col_name = "FullSampleName",
+                                     env_col_name = "Env",
+                                     trait = i,
+                                     grm = grm_cv,
+                                     fixed = fixed_uv,
+                                     random = random_uv,
+                                     residual = residual_uv)
+  
+        #print(seven)
+        
+        #only h2>0.75
+        h_threshold=h_overall %>%
+          filter(Trait==all_of(i)) %>%
+          filter(h2>0.75)
+        z=suwwsn_cv %>% 
+          filter(Env %in% h_threshold$Env)
+        
+        eight<-univariate_five_fold_cv(data = z,
+                                     genotype_col_name = "FullSampleName",
+                                     env_col_name = "Env",
+                                     trait = i,
+                                     grm = grm_cv,
+                                     fixed = fixed_uv,
+                                     random = random_uv,
+                                     residual = residual_uv)
+  
+        #print(eight)
+        
+        #only h2>0.90
+        h_threshold=h_overall %>%
+          filter(Trait==all_of(i)) %>%
+          filter(h2>0.50)
+        z=suwwsn_cv %>% 
+          filter(Env %in% h_threshold$Env)
+        
+        nine<-univariate_five_fold_cv(data = z,
+                                     genotype_col_name = "FullSampleName",
+                                     env_col_name = "Env",
+                                     trait = i,
+                                     grm = grm_cv,
+                                     fixed = fixed_uv,
+                                     random = random_uv,
+                                     residual = residual_uv)
+  
+        #print(nine)
+      }else
+        if(i=="DON"){
+              
+          #only cluster 1
+          z=suwwsn_cv %>% filter(DON_clusters==1)
+          
+          two<-univariate_five_fold_cv(data = z,
+                                       genotype_col_name = "FullSampleName",
+                                       env_col_name = "Env",
+                                       trait = i,
+                                       grm = grm_cv,
+                                       fixed = fixed_uv,
+                                       random = random_uv,
+                                       residual = residual_uv)
+          
+          #print(two)
+          
+          #only cluster 2
+          z=suwwsn_cv %>% filter(DON_clusters==2)
+          
+          three<-univariate_five_fold_cv(data = z,
+                                         genotype_col_name = "FullSampleName",
+                                         env_col_name = "Env",
+                                         trait = i,
+                                         grm = grm_cv,
+                                         fixed = fixed_uv,
+                                         random = random_uv,
+                                         residual = residual_uv)
+          #print(three)
+          
+          #only cluster 3
+          z=suwwsn_cv %>% filter(DON_clusters==3)
+          
+          four<-univariate_five_fold_cv(data = z,
+                                        genotype_col_name = "FullSampleName",
+                                        env_col_name = "Env",
+                                        trait = i,
+                                        grm = grm_cv,
+                                        fixed = fixed_uv,
+                                        random = random_uv,
+                                        residual = residual_uv)
+          
+          #print(four)
+          
+          #only h2>0.1
+          h_threshold=h_overall %>%
+            filter(Trait==all_of(i)) %>%
+            filter(h2>0.1)
+          z=suwwsn_cv %>% 
+            filter(Env %in% h_threshold$Env)
+          
+          five<-univariate_five_fold_cv(data = z,
+                                       genotype_col_name = "FullSampleName",
+                                       env_col_name = "Env",
+                                       trait = i,
+                                       grm = grm_cv,
+                                       fixed = fixed_uv,
+                                       random = random_uv,
+                                       residual = residual_uv)
+          
+          #print(five)
+          
+          #only h2>0.25
+          h_threshold=h_overall %>%
+            filter(Trait==all_of(i)) %>%
+            filter(h2>0.25)
+          z=suwwsn_cv %>% 
+            filter(Env %in% h_threshold$Env)
+          
+          six<-univariate_five_fold_cv(data = z,
+                                       genotype_col_name = "FullSampleName",
+                                       env_col_name = "Env",
+                                       trait = i,
+                                       grm = grm_cv,
+                                       fixed = fixed_uv,
+                                       random = random_uv,
+                                       residual = residual_uv)
+    
+          #print(six)
+          
+          #only h2>0.50
+          h_threshold=h_overall %>%
+            filter(Trait==all_of(i)) %>%
+            filter(h2>0.50)
+          z=suwwsn_cv %>% 
+            filter(Env %in% h_threshold$Env)
+          
+          seven<-univariate_five_fold_cv(data = z,
+                                       genotype_col_name = "FullSampleName",
+                                       env_col_name = "Env",
+                                       trait = i,
+                                       grm = grm_cv,
+                                       fixed = fixed_uv,
+                                       random = random_uv,
+                                       residual = residual_uv)
+    
+          #print(seven)
+          
+          #only h2>0.75
+          h_threshold=h_overall %>%
+            filter(Trait==all_of(i)) %>%
+            filter(h2>0.75)
+          z=suwwsn_cv %>% 
+            filter(Env %in% h_threshold$Env)
+          
+          eight<-univariate_five_fold_cv(data = z,
+                                       genotype_col_name = "FullSampleName",
+                                       env_col_name = "Env",
+                                       trait = i,
+                                       grm = grm_cv,
+                                       fixed = fixed_uv,
+                                       random = random_uv,
+                                       residual = residual_uv)
+    
+          #print(eight)
+          
+          #only h2>0.90
+          h_threshold=h_overall %>%
+            filter(Trait==all_of(i)) %>%
+            filter(h2>0.50)
+          z=suwwsn_cv %>% 
+            filter(Env %in% h_threshold$Env)
+          
+          nine<-univariate_five_fold_cv(data = z,
+                                       genotype_col_name = "FullSampleName",
+                                       env_col_name = "Env",
+                                       trait = i,
+                                       grm = grm_cv,
+                                       fixed = fixed_uv,
+                                       random = random_uv,
+                                       residual = residual_uv)
+    
+          #print(nine)
+          
+        }else{
+          
+          #print
+          print("Something is wrong with the loop")
+          
+      }
+  
+      z=data.frame(Trait=i,
+                   Permutation=j,
+                   Combined_Multivariate=zero,
+                   Combined_Univariate=one,
+                   Cluster_1=two,
+                   Cluster_2=three,
+                   Cluster_3=four,
+                   `h2>0.10`=five,
+                   `h2>0.25`=six,
+                   `h2>0.50`=seven,
+                   `h2>0.75`=eight,
+                   `h2>0.90`=nine,
+                   check.names = F)
+      results<-rbind(results, z)
+    }
+    
+      #performing cross validation
+    if(verbose==T){
+      print(paste("Cross validation for", i, "complete; moving on"))
+    }else{
+        #Do nothing
+    }
+    
+  }
+  
+
+}
+
+#library
+library(ggplot2)
+
+#rename
+colnames(results)<-gsub("H2", "h2", colnames(results))
+
+#visualize the results of CV
+for(i in traits){
+  
+  a<-results %>%
+    filter(Trait==all_of(i)) %>%
+    select(3:ncol(results))
+  a<-a[ , colSums(is.na(a)) < nrow(a)] 
+  b<-c()
+  
+  for(j in colnames(a)){
+    z<-data.frame(Training_Population=j,
+                  R=a[,j],
+                  R2=a[,j]^2)
+    b<-rbind(b,z)
+    remove(z)
+  }
+  
+  b$Training_Population<-gsub("_", " ", b$Training_Population)
+  b<-b %>%
+    filter(!Training_Population=="Combined Multivariate") %>%
+    mutate(Training_Population=ifelse(Training_Population=="Combined Univariate", "Combined", Training_Population))
+  b$Training_Population<-factor(b$Training_Population, levels = unique(b$Training_Population))
+  
+  
+  c<-ggplot(data = b, aes(y=R, x=Training_Population, fill=Training_Population))+
+    geom_boxplot()+
+    theme_bw()+
+    labs(title = paste("Five-Fold, Cross-Validated Prediction Accuracy by Training Population for", i),
+         y="Prediction Accuracy (r)",
+         x="Training Population")+
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 90))
+  print(c)
+}
+
+if(length(files)<1){
+  
+  save.image(file = paste("CV-Results-",Sys.Date(),".RData",sep = ""))  
+  
+}else{
+  
+  #do nothing
+  
+}
+```
+
+# Forward Validation
+
+Now that we have written the models and run the cross validation, we will write a loop for both traits to perform forward validation on the 2020 and 2021 data.
+
+```{r}
+#read in data
+clusters<-read.csv("Environmental_Clustering.csv")
+h2<-read.csv("Environmental_Heritability.csv")
+h2<-h2 %>%
+  filter(!Env %in% h2$Env[grep("20", h2$Env)]&
+           !Env %in% h2$Env[grep("21", h2$Env)]) %>%
+  rename(h2=H2)
+
+#define year
+years<-unique(suwwsn_fv$Year)
+traits<-c("FDK", "DON")
+fv_BLUEs<-c()
+
+#calculate BLUEs within year
+for(i in years){
+  
+  a<-suwwsn_all %>%
+    filter(Year==all_of(i)) %>%
+    select(FullSampleName, Env, all_of(traits))
+  
+  a[,1:2]<-lapply(a[,1:2], as.factor)
+  
+  mv_fit<-asreml(fixed = cbind(FDK, DON)~ trait + FullSampleName + FullSampleName:trait, 
+                 random =~idv(Env), 
+                 residual = ~id(units):idv(trait),
+                 data = a,
+                 trace = FALSE)
+          
+  mv_fit<-predict(mv_fit, classify = "FullSampleName:trait")$pvals
+  
+  for(j in traits){
+    
+    b<-a %>%
+      select(FullSampleName, Env, all_of(j))
+    
+    colnames(b)[3]<-"y"
+    
+    uv_fit<-asreml(fixed = y~FullSampleName,
+                   random = ~idv(Env),
+                   residual = ~idv(units),
+                   data = b,
+                   trace = FALSE)
+    uv_fit<-predict(uv_fit, 
+                    classify = "FullSampleName",
+                    trace = FALSE)$pvals
+    
+    c<-uv_fit[,1:2] %>%
+      mutate(Trait=all_of(j)) %>%
+      mutate(Year=all_of(i)) %>%
+      mutate(Model="Univariate")
+    
+    d<-mv_fit %>%
+      filter(trait==all_of(j)) %>%
+      select(FullSampleName, predicted.value) %>%
+      mutate(Trait=all_of(j)) %>%
+      mutate(Year=all_of(i)) %>%
+      mutate(Model="Multivariate")
+    
+    e<-rbind(c,d)
+    
+    e<-e %>%
+      select(FullSampleName, 
+             Year,
+             Model,
+             Trait,
+             predicted.value) %>%
+      rename(BLUE=predicted.value)
+  
+    fv_BLUEs<-rbind(fv_BLUEs, e)
+    
+    remove(b, c, d, e, uv_fit)
+  }
+  remove(mv_fit, a)
+}
+
+#library
+library(rrBLUP)
+
+#create grm
+grm_all<-A.mat(gbs_mat)
+
+#define models
+fixed_uv = formula(y~1)
+random_uv = formula(~vm(FullSampleName, grm)+idv(Env))
+residual_uv = formula(~idv(units))
+
+#write function to predict
+fv_predict<-function(data,
+                     grm,
+                     fixed,
+                     random,
+                     residual,
+                     genotypes,
+                     trait_name){
+  assign("data", data, envir = globalenv() )
+  assign("fixed", fixed, envir = globalenv() )
+  assign("random", random, envir = globalenv() )
+  assign("residual", residual, envir = globalenv() )
+  
+  
+  fit<-asreml(fixed = fixed,
+              random = random,
+              residual = residual,
+              data = data,
+              trace = FALSE)
+  pred<-predict(fit, classify = "FullSampleName")$pvals[,1:2] %>% filter(FullSampleName %in% genotypes)
+  colnames(pred)[2]=trait_name
+  
+  return(pred)
+}
+
+
+#results object
+results<-c()
+
+#write loop for forward validation
+for(i in years){
+  
+  if(i==2020){
+    a<-suwwsn_all %>%
+      filter(Year<=2020) %>%
+      select(FullSampleName, 
+             Year,
+             Env,
+             all_of(traits))
+    fv<-a %>%
+      filter(Year==2020) %>%
+      select(FullSampleName)
+    a[a$FullSampleName %in% fv$FullSampleName, "FDK"]=NA  
+    a[a$FullSampleName %in% fv$FullSampleName, "DON"]=NA
+  }else
+    if(i==2021){
+      a<-suwwsn_all %>%
+        filter(Year<=2021) %>%
+        filter(!Year==2020) %>%
+        select(FullSampleName, 
+               Year,
+               Env,
+               all_of(traits))
+      fv<-a %>%
+        filter(Year==2021) %>%
+        select(FullSampleName)
+      a[a$FullSampleName %in% fv$FullSampleName, "FDK"]=NA  
+      a[a$FullSampleName %in% fv$FullSampleName, "DON"]=NA 
+    }else{
+      print(paste("Year =", i, "does not make sense; check loop"))
+    }
+  
+  a[,1:3]<-lapply(a[,1:3], as.factor)
+  grm<-grm_all[rownames(grm_all) %in% a$FullSampleName,
+               colnames(grm_all) %in% a$FullSampleName]
+  
+ for(j in traits){
+    
+    b<-a %>%
+      select(FullSampleName, Env, all_of(j))
+    
+    colnames(b)[3]<-"y"
+    
+    clust<-clusters %>%
+      select(Env, grep(j, colnames(clusters)))
+    
+    b<-b %>%
+      left_join(clust, by="Env")
+    
+    colnames(b)[4]="cluster"
+    
+    b<-b %>% 
+      mutate(cluster=ifelse(Env %in% b$Env[grep(i-2000, b$Env)],
+                            "Test",
+                            cluster))
+    h2_trait<-h2 %>%
+      filter(Trait==all_of(j)) %>%
+      filter(!Env %in% b$Env[grep(i-2000, b$Env)]) %>%
+      select(Env, h2)
+    
+    b<-b %>%
+      left_join(h2_trait, by="Env") %>%
+      select(FullSampleName,
+             Env,
+             cluster,
+             h2,
+             y)
+    
+    b[,1:2]<-lapply(b[,1:2], as.factor)
+          
+    if(j=="FDK"){
+      
+      #everything
+      one<-fv_predict(data = b,
+                      grm = grm,
+                      fixed = fixed_uv,
+                      random = random_uv,
+                      residual = residual_uv,
+                      genotypes = fv$FullSampleName,
+                      trait_name = "Combined")
+      
+      #only cluster 1
+      z=b %>% filter(cluster==1|
+                       cluster=="Test")
+      
+      two<-fv_predict(data = z,
+                      grm = grm,
+                      fixed = fixed_uv,
+                      random = random_uv,
+                      residual = residual_uv,
+                      genotypes = fv$FullSampleName,
+                      trait_name = "Cluster 1")
+      
+      #only cluster 2
+      z=b %>% filter(cluster==2|
+                       cluster=="Test")
+      
+      three<-fv_predict(data = z,
+                      grm = grm,
+                      fixed = fixed_uv,
+                      random = random_uv,
+                      residual = residual_uv,
+                      genotypes = fv$FullSampleName,
+                      trait_name = "Cluster 2")
+      
+      
+      #create na object
+      four=NA
+      
+      #only h2>0.1
+      z=b %>% filter(h2>0.1|
+                       cluster=="Test")
+      
+      five<-fv_predict(data = z,
+                      grm = grm,
+                      fixed = fixed_uv,
+                      random = random_uv,
+                      residual = residual_uv,
+                      genotypes = fv$FullSampleName,
+                      trait_name = "h2>0.10")
+      
+      #only h2>0.25
+      z=b %>% filter(h2>0.25|
+                       cluster=="Test")
+      
+      six<-fv_predict(data = z,
+                      grm = grm,
+                      fixed = fixed_uv,
+                      random = random_uv,
+                      residual = residual_uv,
+                      genotypes = fv$FullSampleName,
+                      trait_name = "h2>0.25")
+      
+      #only h2>0.50
+      z=b %>% filter(h2>0.5|
+                       cluster=="Test")
+      
+      seven<-fv_predict(data = z,
+                      grm = grm,
+                      fixed = fixed_uv,
+                      random = random_uv,
+                      residual = residual_uv,
+                      genotypes = fv$FullSampleName,
+                      trait_name = "h2>0.50")
+      
+      #only h2>0.75
+      z=b %>% filter(h2>0.75|
+                       cluster=="Test")
+      
+      eight<-fv_predict(data = z,
+                      grm = grm,
+                      fixed = fixed_uv,
+                      random = random_uv,
+                      residual = residual_uv,
+                      genotypes = fv$FullSampleName,
+                      trait_name = "h2>0.75")
+      
+      #only h2>0.90
+      z=b %>% filter(h2>0.90|
+                       cluster=="Test")
+      
+      nine<-fv_predict(data = z,
+                      grm = grm,
+                      fixed = fixed_uv,
+                      random = random_uv,
+                      residual = residual_uv,
+                      genotypes = fv$FullSampleName,
+                      trait_name = "h2>0.90")
+      
+      #smash together
+      preds<-cbind(Trait=j,
+                   Year=i,
+                   one,
+                   `Cluster 1`=two[,2],
+                   `Cluster 2`=three[,2],
+                   `Cluster 3`=NA,
+                   `h2>0.10`=five[,2],
+                   `h2>0.25`=six[,2],
+                   `h2>0.50`=seven[,2],
+                   `h2>0.75`=eight[,2],
+                   `h2>0.90`=nine[,2])
+      results<-rbind(results,preds)
+      
+    }else
+      if(j=="DON"){
+            
+        
+        #everything
+        one<-fv_predict(data = b,
+                        grm = grm,
+                        fixed = fixed_uv,
+                        random = random_uv,
+                        residual = residual_uv,
+                        genotypes = fv$FullSampleName,
+                        trait_name = "Combined")
+        
+        #only cluster 1
+        z=b %>% filter(cluster==1|
+                         cluster=="Test")
+        
+        two<-fv_predict(data = z,
+                        grm = grm,
+                        fixed = fixed_uv,
+                        random = random_uv,
+                        residual = residual_uv,
+                        genotypes = fv$FullSampleName,
+                        trait_name = "Cluster 1")
+        
+        #only cluster 2
+        z=b %>% filter(cluster==2|
+                         cluster=="Test")
+        
+        three<-fv_predict(data = z,
+                        grm = grm,
+                        fixed = fixed_uv,
+                        random = random_uv,
+                        residual = residual_uv,
+                        genotypes = fv$FullSampleName,
+                        trait_name = "Cluster 2")
+        
+        
+        #only cluster 3
+        z=b %>% filter(cluster==3|
+                         cluster=="Test")
+        
+        four<-fv_predict(data = z,
+                        grm = grm,
+                        fixed = fixed_uv,
+                        random = random_uv,
+                        residual = residual_uv,
+                        genotypes = fv$FullSampleName,
+                        trait_name = "Cluster 2")
+        
+        #only h2>0.1
+        z=b %>% filter(h2>0.1|
+                         cluster=="Test")
+        
+        five<-fv_predict(data = z,
+                        grm = grm,
+                        fixed = fixed_uv,
+                        random = random_uv,
+                        residual = residual_uv,
+                        genotypes = fv$FullSampleName,
+                        trait_name = "h2>0.10")
+        
+        #only h2>0.25
+        z=b %>% filter(h2>0.25|
+                         cluster=="Test")
+        
+        six<-fv_predict(data = z,
+                        grm = grm,
+                        fixed = fixed_uv,
+                        random = random_uv,
+                        residual = residual_uv,
+                        genotypes = fv$FullSampleName,
+                        trait_name = "h2>0.25")
+        
+        #only h2>0.50
+        z=b %>% filter(h2>0.5|
+                         cluster=="Test")
+        
+        seven<-fv_predict(data = z,
+                        grm = grm,
+                        fixed = fixed_uv,
+                        random = random_uv,
+                        residual = residual_uv,
+                        genotypes = fv$FullSampleName,
+                        trait_name = "h2>0.50")
+        
+        #only h2>0.75
+        z=b %>% filter(h2>0.75|
+                         cluster=="Test")
+        
+        eight<-fv_predict(data = z,
+                        grm = grm,
+                        fixed = fixed_uv,
+                        random = random_uv,
+                        residual = residual_uv,
+                        genotypes = fv$FullSampleName,
+                        trait_name = "h2>0.75")
+        
+        #only h2>0.90
+        z=b %>% filter(h2>0.90|
+                         cluster=="Test")
+        
+        nine<-fv_predict(data = z,
+                        grm = grm,
+                        fixed = fixed_uv,
+                        random = random_uv,
+                        residual = residual_uv,
+                        genotypes = fv$FullSampleName,
+                        trait_name = "h2>0.90")
+        
+        #smash together
+        preds<-cbind(Trait=j,
+                     Year=i,
+                     one,
+                     `Cluster 1`=two[,2],
+                     `Cluster 2`=three[,2],
+                     `Cluster 3`=four[,2],
+                     `h2>0.10`=five[,2],
+                     `h2>0.25`=six[,2],
+                     `h2>0.50`=seven[,2],
+                     `h2>0.75`=eight[,2],
+                     `h2>0.90`=nine[,2])
+        results<-rbind(results,preds)
+          
+      }else{
+        
+        #print
+        print("Something is wrong with the loop")
+        
+    }
+  }
+}
+
+fv_preds<-list()
+
+for(i in years){
+  for(j in traits){
+    a<-fv_BLUEs %>%
+      filter(Year==all_of(i) &
+               Trait==all_of(j) &
+               Model=="Univariate") %>%
+      select(FullSampleName, BLUE)
+    b<-results %>%
+      filter(Year==all_of(i) &
+               Trait==all_of(j)) %>%
+      select(-1,-2)
+    c<-full_join(a,b,by="FullSampleName")
+    fv_preds[[paste(j,i,sep="_")]]<-c
+  }
+}
+
+
+fv_table<-c()
+
+for(i in names(fv_preds)){
+  z=ifelse(i=="FDK_2021", "Forward Prediction Accuracy for Percent Fusarium Damaged Kernels in 2021",
+           ifelse(i=="FDK_2020", "Forward Prediction Accuracy for Percent Fusarium Damaged Kernels in 2020",
+                  ifelse(i=="DON_2021", "Forward Prediction Accuracy for Deoxynivalenol Content in 2021",
+                         ifelse(i=="DON_2020", "Forward Prediction Accuracy for Deoxynivalenol Content in 2020", "ERROR"))))
+  
+  a<-fv_preds[[i]]
+  a<-a[ ,colSums(is.na(a)) < nrow(a)]
+  
+  corr=data.frame(R=cor(a[,2:ncol(a)])[-1,1])
+  corr=rownames_to_column(corr, var="Training Population")
+  corr$`Training Population`=factor(corr$`Training Population`, levels = corr$`Training Population`)
+  b<-ggplot(data = corr, aes(x=`Training Population`, y=R, fill=`Training Population`))+
+    geom_col(position = "dodge")+
+    geom_text(aes(label=paste("R =",round(R, digits = 2))), nudge_y = -0.05)+
+    theme_bw()+
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 90))+
+    labs(title = z,
+         y = "Prediction Accuracy (R)")
+    
+  print(b)
+  
+  print(corr)
+  corr<-corr %>%
+    mutate(`Forward Validation Population`=ifelse(i=="FDK_2021", "SUWWSN21",
+                                                  ifelse(i=="FDK_2020", "SUWWSN20",
+                                                         ifelse(i=="DON_2021", "SUWWSN21",
+                                                                ifelse(i=="DON_2020", "SUWWSN20", "ERROR")))),
+           Trait=ifelse(i=="FDK_2021", "FDK",
+                        ifelse(i=="FDK_2020", "FDK",
+                               ifelse(i=="DON_2021", "DON",
+                                      ifelse(i=="DON_2020", "DON", "ERROR"))))) %>%
+    select(`Forward Validation Population`,
+           Trait,
+           `Training Population`,
+           R)
+  
+  fv_table<-rbind(fv_table, corr)
+  
+  pairs.panels(a[,2:ncol(a)], 
+               smooth = F,
+               ellipses = F,
+               lm = T,
+               digits = 2,
+               hist.col = "gray",
+               stars = T,
+               main=z)
+}
+
+write.csv(fv_table,
+          "Forward Validation Table.csv",
+          row.names = F)
+```
+
+# Look at checks within cluster
+
+```{r}
+tp_summary<-c()
+check_means<-c()
+
+traits<-c("FDK", "DON")
+h2fdk<-h_overall %>%
+  filter(Trait=="FDK") %>%
+  select(Env, H2) %>%
+  rename(FDK_H2=H2)
+h2don<-h_overall %>%
+  filter(Trait=="DON") %>%
+  select(Env, H2) %>%
+  rename(DON_H2=H2)
+suwwsn_cv<-suwwsn_cv %>%
+  left_join(h2fdk, by="Env") %>%
+  left_join(h2don, by="Env")
+
+
+for(i in traits){
+  
+  a<-suwwsn_cv %>%
+    select(FullSampleName, 
+           Env,
+           grep(i, colnames(suwwsn_cv)))
+  colnames(a)[3:5]<-c("y", "clusters", "h2")
+  a<-a %>% select(FullSampleName, Env, clusters, h2, y)
+  a[,1:3]<-lapply(a[,1:3], as.factor)
+  
+  s<-data.frame(Trait=i,
+                `Training Population`="Combined",
+                `Number of Observations`=nrow(a),
+                `Number of Genotypes`=length(unique(a$FullSampleName)),
+                `Number of Environments`=length(unique(a$Env)),
+                check.names = F)
+  
+  fit<-asreml(fixed = y~FullSampleName,
+              random = ~idv(Env),
+              residual = ~idv(units),
+              data = a,
+              trace = FALSE)
+  
+  pred<-predict(fit, classify = "FullSampleName")$pvals
+    
+  pred<-pred %>%
+    filter(FullSampleName=="03:110383:ERNIE"|
+           FullSampleName=="03:110384:COKER9835"|
+           FullSampleName=="03:110385:BESS"|
+           FullSampleName=="03:110386:JAMESTOWN") %>%
+    mutate(Trait=all_of(i), 
+           `Training Population`="Combined") %>%
+    select(FullSampleName, 
+           Trait,
+           `Training Population`,
+           predicted.value, 
+           std.error) %>%
+    rename(BLUE=predicted.value,
+           SE=std.error)
+  
+  tp_summary<-rbind(tp_summary, s)
+  check_means=rbind(check_means, pred)
+  
+  remove(s,fit,pred)
+  
+  for(j in unique(a$clusters)){
+    
+    b<-a %>%
+      filter(clusters==all_of(j))
+    
+    s<-data.frame(Trait=i,
+                  `Training Population`=paste("Cluster", j),
+                  `Number of Observations`=nrow(b),
+                  `Number of Genotypes`=length(unique(b$FullSampleName)),
+                  `Number of Environments`=length(unique(b$Env)),
+                  check.names = F)
+    
+    fit<-asreml(fixed = y~FullSampleName,
+                random = ~idv(Env),
+                residual = ~idv(units),
+                data = b,
+                trace = FALSE)
+    
+    pred<-predict(fit, classify = "FullSampleName")$pvals
+    
+    pred<-pred %>%
+      filter(FullSampleName=="03:110383:ERNIE"|
+             FullSampleName=="03:110384:COKER9835"|
+             FullSampleName=="03:110385:BESS"|
+             FullSampleName=="03:110386:JAMESTOWN") %>%
+      mutate(Trait=all_of(i), 
+             `Training Population`=paste("Cluster", all_of(j))) %>%
+      select(FullSampleName, 
+             Trait,
+             `Training Population`,
+             predicted.value, 
+             std.error) %>%
+      rename(BLUE=predicted.value,
+             SE=std.error)
+    
+    tp_summary<-rbind(tp_summary, s)
+    check_means=rbind(check_means, pred)
+    
+  }
+  
+  for(k in c(0.10, 0.25, 0.50, 0.75, 0.90)){
+    
+    b<-a %>%
+      filter(h2>all_of(k))
+  
+    s<-data.frame(Trait=i,
+                 `Training Population`=paste("h2 >", k),
+                 `Number of Observations`=nrow(b),
+                 `Number of Genotypes`=length(unique(b$FullSampleName)),
+                 `Number of Environments`=length(unique(b$Env)),
+                 check.names = F)
+    
+    fit<-asreml(fixed = y~FullSampleName,
+                random = ~idv(Env),
+                residual = ~idv(units),
+                data = b,
+                trace = FALSE)
+    
+    pred<-predict(fit, classify = "FullSampleName")$pvals
+    
+    pred<-pred %>%
+      filter(FullSampleName=="03:110383:ERNIE"|
+             FullSampleName=="03:110384:COKER9835"|
+             FullSampleName=="03:110385:BESS"|
+             FullSampleName=="03:110386:JAMESTOWN") %>%
+      mutate(Trait=all_of(i), 
+             `Training Population`=paste("H2 >",all_of(k))) %>%
+      select(FullSampleName, 
+             Trait,
+             `Training Population`,
+             predicted.value, 
+             std.error) %>%
+      rename(BLUE=predicted.value,
+             SE=std.error)
+    
+    tp_summary<-rbind(tp_summary, s)
+    check_means=rbind(check_means, pred)
+  }
+  
+}
+
+#format
+check_means<-check_means %>%
+  separate(FullSampleName, into=c("a", "b", "c"), sep = ":") %>%
+  select(c, Trait, `Training Population`, BLUE, SE) %>%
+  rename(Genotype=c) %>%
+  mutate(`Training Population`=gsub("H2 > ", "h2>", `Training Population`))
+check_means$`Training Population`<-factor(check_means$`Training Population`, levels = unique(check_means$`Training Population`))
+
+#plot
+a=check_means %>% filter(Trait=="FDK")
+
+ggplot(data = a, aes(y=BLUE, x=`Training Population`, color=Genotype, group=Genotype))+
+  geom_point()+
+  geom_line()+
+  geom_errorbar(aes(ymin=BLUE-SE, ymax=BLUE+SE))+
+  theme_bw()+
+  labs(title = "Check Means Across Training Population for FDK",
+       y="FDK (%)")
+
+a=check_means %>% filter(Trait=="DON")
+a$`Training Population`<-factor(a$`Training Population`, levels = unique(a$`Training Population`))
+
+ggplot(data = a, aes(y=BLUE, x=`Training Population`, color=Genotype, group=Genotype))+
+  geom_point()+
+  geom_line()+
+  geom_errorbar(aes(ymin=BLUE-SE, ymax=BLUE+SE))+
+  theme_bw()+
+  labs(title = "Check Means Across Training Population for DON",
+       y="DON (ppm)")
+
+for(i in traits){
+  a<-filter(tp_summary, Trait==all_of(i)) %>% select(-Trait) %>% mutate(`Training Population`=gsub("h2 > ", "h2>",`Training Population`))
+  print(kable(a, caption = paste("Training Population Summary for", i)))
+}
+
+length(unique(suwwsn_fv$Env))
+```
+
+# Discussion
+
+When we partition environments using clustering, we see a consistent increase in accuracy associated with partitioning data... However, there is no clear pattern the checks are exhibiting... 
+
+# Keep looking at checks
+
+Maybe look a the variance of the checks within cluster. Maybe locations act similarly in some clusters and not in others...
+
+```{r fig.height=11.5, fig.width=6}
+for(i in traits){
+   a<-suwwsn_cv %>%
+    select(FullSampleName, 
+           Env,
+           grep(i, colnames(suwwsn_cv)))%>%
+      filter(FullSampleName=="03:110383:ERNIE"|
+             FullSampleName=="03:110384:COKER9835"|
+             FullSampleName=="03:110385:BESS"|
+             FullSampleName=="03:110386:JAMESTOWN") %>%
+     separate(FullSampleName, into=c("a", "b", "c"), sep = ":") %>%
+     rename(Genotype=c) %>%
+     select(-a, -b)
+     
+  
+   colnames(a)[3:5]<-c("y", "clusters", "h2")
+  
+   a<-a %>% select(Genotype, Env, clusters, h2, y)
+  
+   a[,1:3]<-lapply(a[,1:3], as.factor)
+   
+   z=ifelse(i=="FDK", "Percent Fusarium Damaged Kernels",
+           ifelse(i=="DON", "Deoxynivalenol Content"))
+   
+   d<-ggplot(a, aes(y=y, x=Env, color=Genotype))+
+     geom_point(size=2)+
+     facet_wrap(~Genotype, ncol = 1)+
+     scale_y_continuous(breaks = seq(1, max(b$y)+20, by=5)-1)+
+     theme_bw()+
+     theme(legend.position = "none",
+           axis.text.x = element_text(angle = 90))+
+     labs(title = paste("Comparison of Checks Means of", z, "Across All Environments"),
+          y = z,
+          x = "Environment")+
+     geom_hline(data = a %>% group_by(Genotype) %>% summarise(y_mean=mean(y)),
+                aes(yintercept = y_mean,
+                    color = Genotype),
+                size = 1,
+                lty = 2)
+  
+     print(d)
+  
+   for(j in unique(a$clusters)){
+   
+     b<-a %>%
+       filter(clusters==all_of(j))
+     
+     c<-ggplot(b, aes(y=y, x=Env, color=Genotype))+
+       geom_point(size=2)+
+       facet_wrap(~Genotype, ncol = 1)+
+       scale_y_continuous(breaks = seq(1, max(b$y)+20, by=5)-1)+
+       theme_bw()+
+       theme(legend.position = "none",
+             axis.text.x = element_text(angle = 90))+
+       labs(title = paste("Comparison of Checks Means of", z, "in Cluster", j),
+            y = z,
+            x = "Environment")+
+       geom_hline(data = b %>% group_by(Genotype) %>% summarise(y_mean=mean(y)),
+                  aes(yintercept = y_mean,
+                      color = Genotype),
+                  size = 1,
+                  lty = 2)
+  
+     print(c)
+       
+   }
+  
+   
+}
+```
+
+# Making images for publication
+
+```{r}
+#library
+library(ggplot2)
+library(tidyverse)
+library(usmap)
+
+#get environmental counts
+environments<-suwwsn_all %>% 
+  select(Location, Year, Env) %>%
+  distinct(Env, .keep_all = T) %>%
+  mutate(Location=ifelse(Location=="ALA" | Location=="LA", "Louisiana",
+                         ifelse(Location=="FAR" | Location=="NAR", "Arkansas",
+                                ifelse(Location=="UIL" | Location=="KIL", "Illinois",
+                                       ifelse(Location=="KY", "Kentucky",
+                                              ifelse(Location=="MO", "Missouri",
+                                                     ifelse(Location=="NC", "North Carolina",
+                                                            ifelse(Location=="SC", "South Carolina",
+                                                                   ifelse(Location=="TX", "Texas",
+                                                                          ifelse(Location=="VA", "Virginia", "ERROR")))))))))) %>%
+  group_by(Location) %>%
+  count()
+
+colnames(environments)<-c("state", "Environments")
+
+plot_usmap(region = "states",
+           include = c(unique(environments$state)),
+           data = environments,
+           values = "Environments",
+           labels = T,
+           label_color = "white",
+           color = "black")
+
+#library
+library(maps)
+
+colnames(environments)<-c("region", "Environments")
+environments$region<-tolower(environments$region)
+
+states_dat<-map_data("state") %>%
+  left_join(environments, by="region") %>%
+  drop_na(Environments)
+
+ggplot(data = states_dat, aes(x = long, y = lat, group = group, fill = Environments, labels = group))+
+  geom_polygon(color = "gray90", size = 0.1)+
+  labs(title = "Distribution of SUWWSN Environments from 2011-2021",
+       x="Latitude",
+       y="Longitude",
+       fill="Number of Environments")
+
+ggsave("Figure 1.png",
+       plot = last_plot(),
+       width = 8,
+       height = 5,
+       units = "in",
+       dpi = 300)
+  
+```
+
+# Making tables for publication
+
+```{r}
+#number of total estimable genotypes
+length(unique(suwwsn_all$FullSampleName))
+
+#find cv results
+files<-list.files()
+files<-files[grep("CV-Results", files)]
+load(file = files[1])
+
+#make summary table for results
+cv_results<-results
+
+#make linear results
+cv_results_long<-c()
+
+for(i in 1:nrow(cv_results)){
+  
+  a<-cv_results[i,]
+  b<-as.data.frame(t(a[,3:ncol(a)]))
+  b<-rownames_to_column(b, var="Model")
+  colnames(b)[2]="R"
+  b<-b %>% 
+    mutate(Trait = unique(a$Trait),
+           Permutation = unique(a$Permutation)) %>%
+    select(Trait, Permutation, Model, R)
+  cv_results_long<-rbind(cv_results_long, b)
+  remove(a,b)
+}
+
+#calculate mean of combined univariate
+x_bar_FDK=cv_results_long %>%
+  group_by(Trait, Model) %>%
+  summarise(Min=min(R), 
+            Max = max(R), 
+            Mean=mean(R), 
+            SD=sd(R)) %>%
+  filter(Trait=="FDK") %>%
+  filter(Model=="Combined_Univariate") %>%
+  select(Mean)
+
+x_bar_FDK=x_bar_FDK$Mean
+
+x_bar_DON=cv_results_long %>%
+  group_by(Trait, Model) %>%
+  summarise(Min=min(R), 
+            Max = max(R), 
+            Mean=mean(R), 
+            SD=sd(R)) %>%
+  filter(Trait=="DON") %>%
+  filter(Model=="Combined_Univariate") %>%
+  select(Mean)
+
+x_bar_DON=x_bar_DON$Mean
+
+
+#make a summary 
+cv_results_long$Model<-factor(cv_results_long$Model, levels = unique(cv_results_long$Model))
+cv_summary<-cv_results_long %>%
+  group_by(Trait, Model) %>%
+  summarise(Min=min(R), 
+            Max = max(R), 
+            Mean=mean(R), 
+            SD=sd(R)) %>%
+  mutate(`Z-Score`=ifelse(Trait=="FDK", ((Mean-x_bar_FDK)/SD),
+                        ifelse(Trait=="DON", ((Mean-x_bar_DON)/SD), "Something is Wrong"))) %>%
+  filter(!Model=="Combined_Multivariate") %>%
+  drop_na() %>%
+  mutate(Model=gsub("_", " ", Model)) %>%
+  mutate(Significance=ifelse(`Z-Score`>1.959, "*",
+                             ifelse(`Z-Score`<(-1.959), "*", "NS")))
+
+cv_summary$Model<-gsub("Univariate", "", cv_summary$Model)
+
+#write out summary table
+write.csv(cv_summary,
+          "Summary Table.csv", 
+          row.names = F)
+
+```
